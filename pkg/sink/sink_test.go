@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -30,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	cloudeventstest "github.com/cloudevents/sdk-go/v2/client/test"
@@ -51,6 +53,7 @@ import (
 	"github.com/tektoncd/triggers/pkg/interceptors"
 	celinterceptor "github.com/tektoncd/triggers/pkg/interceptors/cel"
 	"github.com/tektoncd/triggers/pkg/interceptors/server"
+	trresources "github.com/tektoncd/triggers/pkg/resources"
 	"github.com/tektoncd/triggers/pkg/template"
 	"github.com/tektoncd/triggers/test"
 	"go.uber.org/zap"
@@ -58,9 +61,11 @@ import (
 	"go.uber.org/zap/zaptest"
 	"go.uber.org/zap/zaptest/observer"
 	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	fakedynamic "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes"
@@ -171,6 +176,7 @@ func getSinkAssets(t *testing.T, res test.Resources, elName string, webhookInter
 		Logger:                      logger.Sugar(),
 		Auth:                        DefaultAuthOverride{},
 		WGProcessTriggers:           &sync.WaitGroup{},
+		PlanTracker:                 NewCreationTracker(),
 		EventRecorder:               controller.GetEventRecorder(ctx),
 		Recorder:                    recorder,
 		EventListenerLister:         eventlistenerinformer.Get(ctx).Lister(),
@@ -218,11 +224,16 @@ func setupInterceptors(t *testing.T, k kubernetes.Interface, l *zap.SugaredLogge
 	return httpClient
 }
 
-// toTaskRun returns the task run that were created from the given actions
+// toTaskRun returns the task runs created from the given actions.
+// Only create actions are considered: resource creation now also performs
+// lookup actions to reconcile retried events.
 func toTaskRun(t *testing.T, actions []ktesting.Action) []pipelinev1.TaskRun {
 	t.Helper()
 	trs := []pipelinev1.TaskRun{}
 	for i := range actions {
+		if actions[i].GetVerb() != "create" {
+			continue
+		}
 		obj := actions[i].(ktesting.CreateAction).GetObject()
 		// Since we use dynamic client, we cannot directly get the concrete type
 		uns := obj.(*unstructured.Unstructured).Object
@@ -2204,4 +2215,250 @@ func TestExecuteInterceptors_ConcurrentMapWrite(t *testing.T) {
 	wg.Wait()
 
 	t.Log("Test completed without panic")
+}
+
+func planTestSink(t *testing.T) (Sink, *fakedynamic.FakeDynamicClient) {
+	t.Helper()
+	el := &triggersv1beta1.EventListener{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-el",
+			Namespace: namespace,
+			UID:       types.UID(elUID),
+		},
+	}
+	return getSinkAssets(t, test.Resources{EventListeners: []*triggersv1beta1.EventListener{el}}, "test-el", nil)
+}
+
+func taskRunPlanJSON(t *testing.T, name, taskName string) json.RawMessage {
+	t.Helper()
+	return json.RawMessage(fmt.Sprintf(`{"kind":"TaskRun","apiVersion":"tekton.dev/v1","metadata":{"name":%q,"namespace":"foo"},"spec":{"taskRef":{"name":%q}}}`, name, taskName))
+}
+
+func createdResourceNames(actions []ktesting.Action) []string {
+	names := []string{}
+	for _, a := range actions {
+		if a.GetVerb() != "create" {
+			continue
+		}
+		names = append(names, a.(ktesting.CreateAction).GetObject().(*unstructured.Unstructured).GetName())
+	}
+	return names
+}
+
+// TestCreateResources_RetryIsIdempotent verifies that redelivering the same
+// event after every resource was created neither recreates any object nor
+// reports completion a second time.
+func TestCreateResources_RetryIsIdempotent(t *testing.T) {
+	r, dynamicClient := planTestSink(t)
+	log := zaptest.NewLogger(t).Sugar()
+	res := []json.RawMessage{
+		taskRunPlanJSON(t, "taskrun-a", "my-task"),
+		taskRunPlanJSON(t, "taskrun-b", "my-task"),
+	}
+
+	completed, err := r.CreateResources(namespace, "", res, "my-trigger", "event-1", log)
+	if err != nil {
+		t.Fatalf("first attempt failed: %v", err)
+	}
+	if !completed {
+		t.Error("first attempt should report the plan as completed")
+	}
+
+	completed, err = r.CreateResources(namespace, "", res, "my-trigger", "event-1", log)
+	if err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if completed {
+		t.Error("retried attempt must not report completion again (success event would be duplicated)")
+	}
+
+	if diff := cmp.Diff([]string{"taskrun-a", "taskrun-b"}, createdResourceNames(dynamicClient.Actions())); diff != "" {
+		t.Errorf("created resources mismatch (-want +got): %s", diff)
+	}
+}
+
+// TestCreateResources_PartialFailureResumesOnRetry simulates a failure after
+// the first resource was created: the retry must reconcile progress from the
+// cluster, skip the confirmed resource and only create the missing one.
+func TestCreateResources_PartialFailureResumesOnRetry(t *testing.T) {
+	r, dynamicClient := planTestSink(t)
+	log := zaptest.NewLogger(t).Sugar()
+
+	failNextB := true
+	dynamicClient.PrependReactor("create", "taskruns", func(a ktesting.Action) (bool, runtime.Object, error) {
+		ca := a.(ktesting.CreateAction)
+		if failNextB && ca.GetObject().(*unstructured.Unstructured).GetName() == "taskrun-b" {
+			failNextB = false
+			return true, nil, kerrors.NewInternalError(fmt.Errorf("simulated API failure"))
+		}
+		return false, nil, nil
+	})
+
+	res := []json.RawMessage{
+		taskRunPlanJSON(t, "taskrun-a", "my-task"),
+		taskRunPlanJSON(t, "taskrun-b", "my-task"),
+	}
+
+	completed, err := r.CreateResources(namespace, "", res, "my-trigger", "event-1", log)
+	if err == nil {
+		t.Fatal("expected first attempt to fail after taskrun-b could not be created")
+	}
+	if completed {
+		t.Error("a partially failed plan must not be reported completed")
+	}
+
+	// Redelivery: taskrun-a is found and skipped, taskrun-b gets created.
+	completed, err = r.CreateResources(namespace, "", res, "my-trigger", "event-1", log)
+	if err != nil {
+		t.Fatalf("retry should complete the plan, got error: %v", err)
+	}
+	if !completed {
+		t.Error("retry completing the plan should report completion once")
+	}
+
+	// Another redelivery reconciles against the cluster but must not create
+	// anything and must not complete again.
+	createsBefore := len(createdResourceNames(dynamicClient.Actions()))
+	completed, err = r.CreateResources(namespace, "", res, "my-trigger", "event-1", log)
+	if err != nil {
+		t.Fatalf("second retry failed: %v", err)
+	}
+	if completed {
+		t.Error("plan completion must be reported only once")
+	}
+	if got := len(createdResourceNames(dynamicClient.Actions())); got != createsBefore {
+		t.Errorf("retry with every resource already confirmed must not create anything, got %d new create actions",
+			got-createsBefore)
+	}
+
+	// The already confirmed resource was never resubmitted; the missing one was
+	// retried until confirmed (its first submit failed before confirmation).
+	createCounts := map[string]int{}
+	for _, name := range createdResourceNames(dynamicClient.Actions()) {
+		createCounts[name]++
+	}
+	if createCounts["taskrun-a"] != 1 {
+		t.Errorf("confirmed taskrun-a must be created exactly once, got %d attempts", createCounts["taskrun-a"])
+	}
+	if createCounts["taskrun-b"] == 0 {
+		t.Errorf("missing taskrun-b must be retried until created")
+	}
+
+	// Both objects end up in the cluster exactly once (no duplicates).
+	taskRunGVR := schema.GroupVersionResource{Group: "tekton.dev", Version: "v1", Resource: "taskruns"}
+	for _, name := range []string{"taskrun-a", "taskrun-b"} {
+		if _, err := dynamicClient.Resource(taskRunGVR).Namespace(namespace).Get(context.Background(), name, metav1.GetOptions{}); err != nil {
+			t.Errorf("expected %s to exist after retry: %v", name, err)
+		}
+	}
+}
+
+// TestCreateResources_ConflictNotOverwritten verifies that an existing object
+// with the same identity but different content produces a conflict error and
+// no create/update.
+func TestCreateResources_ConflictNotOverwritten(t *testing.T) {
+	r, dynamicClient := planTestSink(t)
+	log := zaptest.NewLogger(t).Sugar()
+
+	if completed, err := r.CreateResources(namespace, "",
+		[]json.RawMessage{taskRunPlanJSON(t, "taskrun-a", "my-task")}, "my-trigger", "event-1", log); err != nil || !completed {
+		t.Fatalf("first attempt should complete, got completed=%v err=%v", completed, err)
+	}
+
+	// Same plan identity, but the template now renders different content.
+	completed, err := r.CreateResources(namespace, "",
+		[]json.RawMessage{taskRunPlanJSON(t, "taskrun-a", "a-different-task")}, "my-trigger", "event-1", log)
+	if !errors.Is(err, trresources.ErrResourceConflict) {
+		t.Fatalf("expected ErrResourceConflict, got: %v", err)
+	}
+	if completed {
+		t.Error("a conflicting plan must not be reported completed")
+	}
+	if diff := cmp.Diff([]string{"taskrun-a"}, createdResourceNames(dynamicClient.Actions())); diff != "" {
+		t.Errorf("existing object must not be overwritten (-want +got): %s", diff)
+	}
+	for _, a := range dynamicClient.Actions() {
+		if a.GetVerb() == "update" || a.GetVerb() == "patch" {
+			t.Errorf("conflict must not result in an %s action", a.GetVerb())
+		}
+	}
+}
+
+// TestCreateResources_GenerateNameNoDuplicate verifies templates using
+// generateName do not produce a second generated object on retry.
+func TestCreateResources_GenerateNameNoDuplicate(t *testing.T) {
+	r, dynamicClient := planTestSink(t)
+	log := zaptest.NewLogger(t).Sugar()
+	res := []json.RawMessage{
+		json.RawMessage(`{"kind":"TaskRun","apiVersion":"tekton.dev/v1","metadata":{"generateName":"run-","namespace":"foo"},"spec":{"taskRef":{"name":"my-task"}}}`),
+	}
+
+	if completed, err := r.CreateResources(namespace, "", res, "my-trigger", "event-1", log); err != nil || !completed {
+		t.Fatalf("first attempt should complete, got completed=%v err=%v", completed, err)
+	}
+	if completed, err := r.CreateResources(namespace, "", res, "my-trigger", "event-1", log); err != nil || completed {
+		t.Fatalf("retry should be a non-completing no-op, got completed=%v err=%v", completed, err)
+	}
+
+	names := createdResourceNames(dynamicClient.Actions())
+	if len(names) != 1 {
+		t.Fatalf("expected exactly one generated resource, got %d: %v", len(names), names)
+	}
+	if !strings.HasPrefix(names[0], "run-") {
+		t.Errorf("generated resource %q does not keep the generateName prefix", names[0])
+	}
+}
+
+func TestCreationTracker_CompletionOnce(t *testing.T) {
+	tracker := NewCreationTracker()
+	key := creationPlanKey("event-1", namespace, "my-trigger")
+
+	if !tracker.MarkPlanCompleted(key) {
+		t.Error("first MarkPlanCompleted should win")
+	}
+	if tracker.MarkPlanCompleted(key) {
+		t.Error("later MarkPlanCompleted calls must not report completion again")
+	}
+
+	// A nil tracker is permissive so clients without tracking keep the
+	// historical behavior.
+	var nilTracker *CreationTracker
+	if !nilTracker.MarkPlanCompleted(key) {
+		t.Error("nil tracker should always report completion")
+	}
+	nilTracker.LockPlan(key)()
+}
+
+func TestCreationTracker_LockSerializesSamePlan(t *testing.T) {
+	tracker := NewCreationTracker()
+	key := creationPlanKey("event-1", namespace, "my-trigger")
+
+	unlock := tracker.LockPlan(key)
+	acquired := make(chan struct{})
+	go func() {
+		release := tracker.LockPlan(key)
+		close(acquired)
+		release()
+	}()
+
+	select {
+	case <-acquired:
+		t.Error("a second attempt on the same plan should block while the first is running")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Error("the second attempt should proceed after the plan lock is released")
+	}
+
+	// The lock entry is released after use to avoid unbounded growth.
+	tracker.mu.Lock()
+	locks := len(tracker.locks)
+	tracker.mu.Unlock()
+	if locks != 0 {
+		t.Errorf("expected plan locks to be cleaned up, got %d", locks)
+	}
 }

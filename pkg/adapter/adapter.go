@@ -230,6 +230,7 @@ func (s *sinker) Start(ctx context.Context) error {
 		CloudEventURI:          s.Args.CloudEventURI,
 		Auth:                   sink.DefaultAuthOverride{},
 		WGProcessTriggers:      &sync.WaitGroup{},
+		PlanTracker:            sink.NewCreationTracker(),
 		EventRecorder:          s.createRecorder(s.injCtx, "EventListener"), //nolint:contextcheck
 
 		// Register all the listers we'll need

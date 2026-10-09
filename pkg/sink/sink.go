@@ -27,6 +27,7 @@ import (
 	net "net/url"
 	"os"
 	"sync"
+	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/cloudevents/sdk-go/v2/binding"
@@ -76,6 +77,10 @@ type Sink struct {
 	// Currently only used in tests to wait for all triggers to finish processing
 	WGProcessTriggers *sync.WaitGroup
 	EventRecorder     record.EventRecorder
+	// PlanTracker deduplicates resource creation and success events for
+	// retried deliveries of the same event/trigger. It may be nil (e.g. the
+	// triggerrun CLI), in which case every call is treated as a first attempt.
+	PlanTracker *CreationTracker
 
 	// listers index properties about resources
 	EventListenerLister         listers.EventListenerLister
@@ -445,13 +450,21 @@ func (r Sink) processTrigger(t triggersv1.Trigger, el *triggersv1.EventListener,
 	log.Infof("ResolvedParams : %+v", params)
 	resources := template.ResolveResources(rt.TriggerTemplate, params)
 
-	if err := r.CreateResources(t.Namespace, t.Spec.ServiceAccountName, resources, t.Name, eventID, log); err != nil {
+	// CreateResources reconciles the whole creation plan with the cluster:
+	// resources already confirmed from an earlier attempt are skipped and only
+	// missing ones are created. completed is true only for the first attempt in
+	// which the whole plan is confirmed, so the success event is emitted at
+	// most once per event/trigger.
+	completed, err := r.CreateResources(t.Namespace, t.Spec.ServiceAccountName, resources, t.Name, eventID, log)
+	if err != nil {
 		log.Error(err)
 		return
 	}
 	go r.recordResourceCreation(resources)
-	r.emitEvents(r.EventRecorder, el, events.TriggerProcessingSuccessfulV1, nil)
-	r.sendCloudEvents(request.Header, *el, eventID, events.TriggerProcessingSuccessfulV1)
+	if completed {
+		r.emitEvents(r.EventRecorder, el, events.TriggerProcessingSuccessfulV1, nil)
+		r.sendCloudEvents(request.Header, *el, eventID, events.TriggerProcessingSuccessfulV1)
+	}
 }
 
 func (r Sink) ExecuteTriggerInterceptors(t triggersv1.Trigger, in *http.Request, event []byte, log *zap.SugaredLogger, eventID string, extensions map[string]interface{}) ([]byte, http.Header, *triggersv1.InterceptorResponse, error) {
@@ -594,7 +607,19 @@ func (r Sink) ExecuteInterceptors(trInt []*triggersv1.TriggerInterceptor, in *ht
 	}, nil
 }
 
-func (r Sink) CreateResources(triggerNS, sa string, res []json.RawMessage, triggerName, eventID string, log *zap.SugaredLogger) error {
+// CreateResources creates every rendered resource of a TriggerTemplate for one
+// event. The work is tracked as one creation plan identified by eventID, the
+// trigger namespace/name and the position of each resource within the
+// template: every resource is reconciled against the cluster before it is
+// submitted, so retrying (partially) failed or redelivered events never
+// recreates objects that are already confirmed and only the missing resources
+// are created. Progress can therefore always be rebuilt from Kubernetes even
+// after the sink restarted or an earlier record was lost.
+//
+// It returns completed=true only for the first attempt in which every resource
+// of the plan is confirmed, which lets the caller emit the success event
+// exactly once.
+func (r Sink) CreateResources(triggerNS, sa string, res []json.RawMessage, triggerName, eventID string, log *zap.SugaredLogger) (bool, error) {
 	discoveryClient := r.DiscoveryClient
 	dynamicClient := r.DynamicClient
 	var err error
@@ -604,20 +629,129 @@ func (r Sink) CreateResources(triggerNS, sa string, res []json.RawMessage, trigg
 
 		// However, we also have a ServiceAccountName reference with each EventListenerTrigger to allow
 		// for more fine grained authorization control around the resources we create below.
+		// The override clients are not cached: a redelivered event after a
+		// credential change or failed impersonation gets a fresh client.
 		discoveryClient, dynamicClient, err = r.Auth.OverrideAuthentication(sa, triggerNS, log, r.DiscoveryClient, r.DynamicClient)
 		if err != nil {
 			log.Errorf("problem cloning rest config: %#v", err)
-			return err
+			return false, err
 		}
 	}
 
-	for _, rr := range res {
-		if err := resources.Create(r.Logger, rr, triggerName, eventID, r.EventListenerName, triggerNS, discoveryClient, dynamicClient); err != nil {
+	planKey := creationPlanKey(eventID, triggerNS, triggerName)
+	// Serialize concurrent deliveries of the same event (e.g. a retry arriving
+	// before the first attempt finished) so they cannot race each other into
+	// duplicate creates.
+	defer r.PlanTracker.LockPlan(planKey)()
+
+	for i, rr := range res {
+		if err := resources.Create(r.Logger, rr, triggerName, eventID, r.EventListenerName, triggerNS, i, discoveryClient, dynamicClient); err != nil {
 			log.Errorf("problem creating obj: %#v", err)
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return r.PlanTracker.MarkPlanCompleted(planKey), nil
+}
+
+// planLockReferenceCount bounds how long plan locks and completion records are
+// retained by a CreationTracker.
+const (
+	// completedPlanRetention is how long a completed plan is remembered so
+	// that late redeliveries do not emit another success event. Progress
+	// itself is always rebuilt from the cluster.
+	completedPlanRetention = time.Hour
+	// completedPlanSweepThreshold keeps the in-memory record from growing
+	// without bound on long-running sinks.
+	completedPlanSweepThreshold = 1024
+)
+
+// CreationTracker keeps the per-event in-memory state used to deduplicate
+// concurrent and retried trigger processing within one sink process. It does
+// not hold authoritative creation progress: that is rebuilt from Kubernetes on
+// every CreateResources call, so losing the tracker (process restart) does not
+// lead to duplicate resources.
+type CreationTracker struct {
+	mu sync.Mutex
+	// locks serializes processing of one event/trigger plan. Entries are
+	// removed once the last holder releases them.
+	locks map[string]*planLock
+	// completedAt records when every resource of a plan was confirmed.
+	completedAt map[string]time.Time
+}
+
+type planLock struct {
+	sync.Mutex
+	refs int
+}
+
+// NewCreationTracker returns an empty CreationTracker.
+func NewCreationTracker() *CreationTracker {
+	return &CreationTracker{
+		locks:       map[string]*planLock{},
+		completedAt: map[string]time.Time{},
+	}
+}
+
+func creationPlanKey(eventID, triggerNS, triggerName string) string {
+	return fmt.Sprintf("%s/%s/%s", eventID, triggerNS, triggerName)
+}
+
+// LockPlan serializes processing of a single event/trigger creation plan. The
+// returned function releases the plan and must be called once the attempt is
+// done. It is safe to call on a nil tracker, in which case it is a no-op.
+func (c *CreationTracker) LockPlan(key string) func() {
+	if c == nil {
+		return func() {}
+	}
+
+	c.mu.Lock()
+	lock := c.locks[key]
+	if lock == nil {
+		lock = &planLock{}
+		c.locks[key] = lock
+	}
+	lock.refs++
+	c.mu.Unlock()
+
+	lock.Lock()
+	return func() {
+		lock.Unlock()
+
+		c.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(c.locks, key)
+		}
+		c.mu.Unlock()
+	}
+}
+
+// MarkPlanCompleted records that all resources of the plan are confirmed. It
+// returns true only for the first caller for a given plan key; later retries
+// get false and must not emit another success event. It is safe to call on a
+// nil tracker, in which case it always reports completion.
+func (c *CreationTracker) MarkPlanCompleted(key string) bool {
+	if c == nil {
+		return true
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, completed := c.completedAt[key]; completed {
+		return false
+	}
+	c.completedAt[key] = time.Now()
+
+	if len(c.completedAt) > completedPlanSweepThreshold {
+		cutoff := time.Now().Add(-completedPlanRetention)
+		for k, completedAt := range c.completedAt {
+			if completedAt.Before(cutoff) {
+				delete(c.completedAt, k)
+			}
+		}
+	}
+	return true
 }
 
 // extendBodyWithExtensions merges the extensions into the given body.
