@@ -62,8 +62,12 @@ func findAPIResource(apiVersion, kind string, c discoveryclient.ServerResourcesI
 }
 
 // Create uses the kubeClient to create the resource defined in the
-// TriggerResourceTemplate and returns any errors with this process
-func Create(logger *zap.SugaredLogger, rt json.RawMessage, triggerName, eventID, elName, elNamespace string, c discoveryclient.ServerResourcesInterface, dc dynamic.Interface) error {
+// TriggerResourceTemplate and returns any errors with this process.
+//
+// The caller controls the lifecycle of ctx: the sink passes a context
+// detached from graceful-shutdown cancellation for create calls already in
+// flight, so an acknowledged API call is never abandoned mid-submission.
+func Create(logger *zap.SugaredLogger, ctx context.Context, rt json.RawMessage, triggerName, eventID, elName, elNamespace string, c discoveryclient.ServerResourcesInterface, dc dynamic.Interface) error {
 	// Assume the TriggerResourceTemplate is valid (it has an apiVersion and Kind)
 	data := new(unstructured.Unstructured)
 	if err := data.UnmarshalJSON(rt); err != nil {
@@ -105,7 +109,7 @@ func Create(logger *zap.SugaredLogger, rt json.RawMessage, triggerName, eventID,
 
 	logger.Infof("For event ID %q creating resource %v", eventID, gvr)
 
-	if _, err := dc.Resource(gvr).Namespace(namespace).Create(context.Background(), data, metav1.CreateOptions{}); err != nil {
+	if _, err := dc.Resource(gvr).Namespace(namespace).Create(ctx, data, metav1.CreateOptions{}); err != nil {
 		if kerrors.IsUnauthorized(err) || kerrors.IsForbidden(err) {
 			return err
 		}

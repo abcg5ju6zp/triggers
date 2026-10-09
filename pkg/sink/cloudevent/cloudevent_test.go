@@ -17,6 +17,7 @@ limitations under the License.
 package cloudevent
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cloudevents/sdk-go/v2/client/test"
@@ -66,7 +67,7 @@ func TestSendCloudEvents(t *testing.T) {
 		EL:        el,
 	}
 
-	resource.SendCloudEvents()
+	resource.SendCloudEvents(context.Background())
 	received := <-eventCh
 	testCE.AssertEventEquals(t, e, received)
 }

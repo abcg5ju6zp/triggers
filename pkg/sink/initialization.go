@@ -74,6 +74,9 @@ var (
 	elMaxBodySize = flag.Int64("max-body-size", 3*1024*1024,
 		"The maximum accepted request body size in bytes for EventListener Server. Zero or less disables the limit.")
 	cloudEventURI = flag.String("cloudevent-uri", "", "uri for cloudevent")
+	elShutdownGracePeriod = flag.Int64("shutdown-grace-period", 20,
+		"The grace period in seconds for the EventListener to finish processing accepted events after receiving a termination signal. "+
+			"Should be lower than the Pod terminationGracePeriodSeconds so that in-flight events can converge before the Pod is force killed.")
 )
 
 // Args define the arguments for Sink.
@@ -114,6 +117,10 @@ type Args struct {
 	ELMaxBodySize int64
 	// CloudEventURI refers to the location where cloudevent data need to be send
 	CloudEventURI string
+	// ELShutdownGracePeriod defines how long the sink waits for accepted events
+	// to finish processing after a termination signal, before cancelling work
+	// that has not started yet.
+	ELShutdownGracePeriod time.Duration
 }
 
 // Clients define the set of client dependencies Sink requires.
@@ -157,6 +164,7 @@ func GetArgs() (Args, error) {
 		Cert:                              *tlsCertFlag,
 		Key:                               *tlsKeyFlag,
 		CloudEventURI:                     *cloudEventURI,
+		ELShutdownGracePeriod:             time.Duration(*elShutdownGracePeriod),
 	}, nil
 }
 

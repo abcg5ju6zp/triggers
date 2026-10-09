@@ -128,7 +128,7 @@ func trigger(triggerFile, httpPath, action, kubeconfig string, writer io.Writer)
 			}
 		case "create":
 			{
-				err := r.CreateResources(tri.Namespace, "", resources, tri.Name, eventID, eventLog)
+				err := r.CreateResources(ctx, tri.Namespace, "", resources, tri.Name, eventID, eventLog)
 				if err != nil {
 					return fmt.Errorf("fail to create resources: %w", err)
 				}
@@ -196,7 +196,7 @@ func processTriggerSpec(kubeClient kubernetes.Interface, client triggersclientse
 
 	log := eventLog.With(zap.String(triggers.TriggerLabelKey, r.EventListenerName))
 
-	finalPayload, header, iresp, err := r.ExecuteTriggerInterceptors(*tri, request, body, log, eventID, map[string]interface{}{})
+	finalPayload, header, iresp, err := r.ExecuteTriggerInterceptors(context.Background(), *tri, request, body, log, eventID, map[string]interface{}{})
 	if err != nil {
 		log.Error(err)
 		return nil, err

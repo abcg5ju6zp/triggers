@@ -42,8 +42,11 @@ type Resource struct {
 }
 
 // SendCloudEvents is used by the EventListener to send cloud events status of
-// trigger processing
-func (r Resource) SendCloudEvents() {
+// trigger processing. The provided context governs delivery (including the
+// exponential-backoff retries); terminal events are sent with a context that
+// is not cancelled by graceful shutdown so that an in-flight terminal
+// notification is allowed to finish.
+func (r Resource) SendCloudEvents(ctx context.Context) {
 	logger := r.Logger.With(zap.String("trigger", r.EL.Name))
 
 	event := cloudevents.NewEvent()
@@ -65,7 +68,7 @@ func (r Resource) SendCloudEvents() {
 	}
 
 	// Send the event.
-	result := r.Client.Send(cloudevents.ContextWithTarget(cloudevents.ContextWithRetriesExponentialBackoff(context.Background(), 10*time.Millisecond, 10), r.TargetURI), event)
+	result := r.Client.Send(cloudevents.ContextWithTarget(cloudevents.ContextWithRetriesExponentialBackoff(ctx, 10*time.Millisecond, 10), r.TargetURI), event)
 
 	if !cloudevents.IsACK(result) {
 		logger.With(zap.Error(result)).Error("failed to send cloudevent.")

@@ -64,6 +64,17 @@ func NewEnvConfig() adapter.EnvConfigAccessor {
 var (
 	interval = 10 * time.Second
 	timeout  = 1 * time.Minute
+
+	// serverShutdownTimeout bounds how long the HTTP listener waits for
+	// in-flight HTTP handlers (which return as soon as the 202 is written).
+	serverShutdownTimeout = 10 * time.Second
+	// drainTimeout bounds the wind-down after the grace period expired:
+	// in-flight interceptor calls are cancelled, while Kubernetes create calls
+	// already submitted run on a detached context and must return first.
+	drainTimeout = 8 * time.Second
+	// notificationsTimeout bounds the wait for handler-level CloudEvents that
+	// were already being delivered when shutdown started.
+	notificationsTimeout = 5 * time.Second
 )
 
 // sinker implements the adapter for an event listener.
@@ -76,6 +87,11 @@ type sinker struct {
 	Recorder *sink.Recorder
 
 	injCtx context.Context //nolint:containedctx
+
+	// recorderStop is closed only after all accepted events have converged
+	// during shutdown, so Kubernetes Event deliveries for terminal trigger
+	// states are not cut off ahead of the result they describe.
+	recorderStop chan struct{}
 }
 
 var _ adapter.Adapter = (*sinker)(nil)
@@ -96,7 +112,10 @@ func (s *sinker) createRecorder(ctx context.Context, agentName string) record.Ev
 
 		recorder = eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: agentName})
 		go func() {
-			<-ctx.Done()
+			// Do not stop on the signal context: shutdown closes recorderStop
+			// only after all in-flight events and their terminal events have
+			// been processed, so terminal Kubernetes Events are not dropped.
+			<-s.recorderStop
 			for _, w := range watches {
 				w.Stop()
 			}
@@ -214,6 +233,12 @@ func (s *sinker) Start(ctx context.Context) error {
 
 	dynamicClient := dynamicclient.Get(ctx)
 
+	// A single tracker accounts for every accepted eventID and its outer
+	// triggers/groups as well as group-internal branches. The WaitGroup is
+	// retained as the legacy accounting hook.
+	wg := &sync.WaitGroup{}
+	inflight := sink.NewInflightTracker(wg)
+
 	r := sink.Sink{
 		KubeClientSet:          kubeclient.Get(ctx),
 		DiscoveryClient:        s.Clients.DiscoveryClient,
@@ -229,7 +254,8 @@ func (s *sinker) Start(ctx context.Context) error {
 		Recorder:               s.Recorder,
 		CloudEventURI:          s.Args.CloudEventURI,
 		Auth:                   sink.DefaultAuthOverride{},
-		WGProcessTriggers:      &sync.WaitGroup{},
+		WGProcessTriggers:      wg,
+		Inflight:               inflight,
 		EventRecorder:          s.createRecorder(s.injCtx, "EventListener"), //nolint:contextcheck
 
 		// Register all the listers we'll need
@@ -265,16 +291,100 @@ func (s *sinker) Start(ctx context.Context) error {
 			s.Args.ELTimeOutHandler*time.Second, "EventListener Timeout!\n"), //nolint:durationcheck
 	}
 
-	if s.Args.Cert == "" && s.Args.Key == "" {
-		if err := srv.ListenAndServe(); err != nil {
-			return err
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", srv.Addr)
+	if err != nil {
+		return err
+	}
+	serverErr := make(chan error, 1)
+	go func() {
+		var serveErr error
+		if s.Args.Cert == "" && s.Args.Key == "" {
+			serveErr = srv.Serve(ln)
+		} else {
+			serveErr = srv.ServeTLS(ln, s.Args.Cert, s.Args.Key)
 		}
-	} else {
-		if err := srv.ListenAndServeTLS(s.Args.Cert, s.Args.Key); err != nil {
-			return err
+		if !errors.Is(serveErr, http.ErrServerClosed) {
+			serverErr <- serveErr
+		}
+	}()
+
+	// Serve until the listener fails or a termination signal cancels ctx.
+	select {
+	case serveErr := <-serverErr:
+		return serveErr
+	case <-ctx.Done():
+		s.Logger.Info("termination signal received: stop accepting new events and wait for accepted events to finish")
+	}
+
+	return s.shutdown(ctx, srv, inflight, serverErr)
+}
+
+// shutdown runs the ordered graceful shutdown of the sink:
+//  1. stop accepting new HTTP requests (accepted events keep processing),
+//  2. wait for every accepted eventID's outer triggers/groups and group
+//     branches to converge during the grace period,
+//  3. if the grace period expires, cancel work that has not started yet and
+//     wait for Kubernetes calls already submitted to return; those branches
+//     then report a deterministic incomplete (failed) terminal result,
+//  4. wait for handler-level CloudEvent notifications in flight,
+//  5. only then release the Kubernetes event recorder.
+func (s *sinker) shutdown(sigCtx context.Context, srv *http.Server, inflight *sink.InflightTracker, serverErr <-chan error) error {
+	inflight.BeginShutdown()
+
+	// Phase 1: close the listener first. Handlers return as soon as the 202 is
+	// written; the actual trigger processing is tracked by inflight below.
+	serverCtx, cancelServer := context.WithTimeout(context.WithoutCancel(sigCtx), serverShutdownTimeout)
+	if err := srv.Shutdown(serverCtx); err != nil {
+		s.Logger.Warnf("HTTP server did not stop within %s, forcing close: %v", serverShutdownTimeout, err)
+		if closeErr := srv.Close(); closeErr != nil {
+			s.Logger.Warnf("error closing HTTP server: %v", closeErr)
 		}
 	}
-	return nil
+	cancelServer()
+
+	// Phase 2: give accepted events the grace period to converge normally.
+	gracePeriod := s.Args.ELShutdownGracePeriod * time.Second //nolint:durationcheck
+	if gracePeriod <= 0 {
+		gracePeriod = 20 * time.Second
+	}
+	graceCtx, cancelGrace := context.WithTimeout(context.WithoutCancel(sigCtx), gracePeriod)
+	completed := inflight.WaitAll(graceCtx)
+	cancelGrace()
+
+	if !completed {
+		// Phase 3: cancel events that have not finished so branches skip work
+		// they have not started; branches with a Kubernetes create in flight
+		// wait for that call (it uses a context detached from cancellation)
+		// and then emit the deterministic interrupted terminal result.
+		s.Logger.Warnf("shutdown grace period of %s expired; cancelling unstarted work for events: %v", gracePeriod, inflight.InflightEventIDs())
+		inflight.CancelUnfinished()
+
+		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(sigCtx), drainTimeout)
+		if !inflight.WaitAll(drainCtx) {
+			s.Logger.Errorf("event processing did not wind down within %s for events: %v", drainTimeout, inflight.InflightEventIDs())
+		}
+		cancelDrain()
+	}
+
+	// Phase 4: let handler-level CloudEvent notifications already in flight
+	// finish delivering.
+	notifyCtx, cancelNotify := context.WithTimeout(context.WithoutCancel(sigCtx), notificationsTimeout)
+	if !inflight.WaitNotifications(notifyCtx) {
+		s.Logger.Warnf("not all status CloudEvents were delivered within %s", notificationsTimeout)
+	}
+	cancelNotify()
+
+	// Phase 5: terminal Kubernetes Events have all been emitted now; release
+	// the event broadcaster so queued events can be flushed.
+	close(s.recorderStop)
+
+	select {
+	case serveErr := <-serverErr:
+		return serveErr
+	default:
+		return nil
+	}
 }
 
 func New(sinkArgs sink.Args, sinkClients sink.Clients, recorder *sink.Recorder) adapter.AdapterConstructor {
@@ -283,12 +393,13 @@ func New(sinkArgs sink.Args, sinkClients sink.Clients, recorder *sink.Recorder) 
 		logger := logging.FromContext(ctx)
 
 		return &sinker{
-			Logger:    logger,
-			Namespace: env.Namespace,
-			Args:      sinkArgs,
-			Clients:   sinkClients,
-			Recorder:  recorder,
-			injCtx:    ctx,
+			Logger:       logger,
+			Namespace:    env.Namespace,
+			Args:         sinkArgs,
+			Clients:      sinkClients,
+			Recorder:     recorder,
+			injCtx:       ctx,
+			recorderStop: make(chan struct{}),
 		}
 	}
 }

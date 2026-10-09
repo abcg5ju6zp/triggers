@@ -156,9 +156,13 @@ func getSinkAssets(t *testing.T, res test.Resources, elName string, webhookInter
 	// Setup a handler for core interceptors using httptest
 	httpClient := setupInterceptors(t, clients.Kube, logger.Sugar(), webhookInterceptor)
 
-	ceClient, _ := cloudeventstest.NewMockSenderClient(t, 1)
+	// Terminal CloudEvents are now delivered synchronously inside processing
+	// branches in addition to the asynchronous started/done notifications, so
+	// the mock channel needs to buffer every delivery for one event.
+	ceClient, _ := cloudeventstest.NewMockSenderClient(t, 64)
 
 	recorder, _ := NewRecorder()
+	wg := &sync.WaitGroup{}
 	r := Sink{
 		EventListenerName:           elName,
 		EventListenerNamespace:      namespace,
@@ -170,7 +174,8 @@ func getSinkAssets(t *testing.T, res test.Resources, elName string, webhookInter
 		CEClient:                    ceClient,
 		Logger:                      logger.Sugar(),
 		Auth:                        DefaultAuthOverride{},
-		WGProcessTriggers:           &sync.WaitGroup{},
+		WGProcessTriggers:           wg,
+		Inflight:                    NewInflightTracker(wg),
 		EventRecorder:               controller.GetEventRecorder(ctx),
 		Recorder:                    recorder,
 		EventListenerLister:         eventlistenerinformer.Get(ctx).Lister(),
@@ -1587,7 +1592,7 @@ func TestExecuteInterceptor_Sequential(t *testing.T) {
 			if err != nil {
 				t.Fatalf("http.NewRequest: %v", err)
 			}
-			resp, header, _, err := r.ExecuteTriggerInterceptors(trigger, req, []byte(`{}`), logger.Sugar(), eventID, map[string]interface{}{})
+			resp, header, _, err := r.ExecuteTriggerInterceptors(context.Background(), trigger, req, []byte(`{}`), logger.Sugar(), eventID, map[string]interface{}{})
 			if err != nil {
 				t.Fatalf("executeInterceptors: %v", err)
 			}
@@ -1663,7 +1668,7 @@ func TestExecuteInterceptor_error(t *testing.T) {
 	if err != nil {
 		t.Fatalf("http.NewRequest: %v", err)
 	}
-	if resp, _, _, err := s.ExecuteTriggerInterceptors(trigger, req, nil, logger.Sugar(), eventID, map[string]interface{}{}); err == nil {
+	if resp, _, _, err := s.ExecuteTriggerInterceptors(context.Background(), trigger, req, nil, logger.Sugar(), eventID, map[string]interface{}{}); err == nil {
 		t.Errorf("expected error, got: %+v, %v", string(resp), err)
 	}
 
@@ -1688,7 +1693,7 @@ func TestExecuteInterceptor_NotContinue(t *testing.T) {
 			}}},
 	}
 	url, _ := url.Parse("http://example.com")
-	_, _, resp, err := s.ExecuteTriggerInterceptors(trigger, &http.Request{URL: url}, json.RawMessage(`{"head": "blah"}`), s.Logger, "eventID", map[string]interface{}{})
+	_, _, resp, err := s.ExecuteTriggerInterceptors(context.Background(), trigger, &http.Request{URL: url}, json.RawMessage(`{"head": "blah"}`), s.Logger, "eventID", map[string]interface{}{})
 	if err != nil {
 		t.Fatalf("ExecuteInterceptor() unexpected error: %v", err)
 	}
@@ -1765,7 +1770,7 @@ func TestExecuteInterceptor_ExtensionChaining(t *testing.T) {
 		t.Fatalf("http.NewRequest: %v", err)
 	}
 	body := fmt.Sprintf(`{"sha": "%s"}`, sha)
-	resp, _, iresp, err := s.ExecuteTriggerInterceptors(trigger, req, []byte(body), s.Logger, eventID, map[string]interface{}{})
+	resp, _, iresp, err := s.ExecuteTriggerInterceptors(context.Background(), trigger, req, []byte(body), s.Logger, eventID, map[string]interface{}{})
 	if err != nil {
 		t.Fatalf("executeInterceptors: %v", err)
 	}
@@ -1855,7 +1860,7 @@ func TestExecuteInterceptor_WebhookFirstGetsRawURLEncodedBody(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	if _, _, _, err := s.ExecuteTriggerInterceptors(trigger, req, []byte(rawBody), s.Logger, eventID, map[string]interface{}{}); err != nil {
+	if _, _, _, err := s.ExecuteTriggerInterceptors(context.Background(), trigger, req, []byte(rawBody), s.Logger, eventID, map[string]interface{}{}); err != nil {
 		t.Fatalf("executeInterceptors: %v", err)
 	}
 
@@ -1895,7 +1900,7 @@ func TestExecuteInterceptor_WebhookFirstWithExtensionsGetsJSONBody(t *testing.T)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	extensions := map[string]interface{}{"added_field": "val1"}
-	if _, _, _, err := s.ExecuteTriggerInterceptors(trigger, req, []byte(rawBody), s.Logger, eventID, extensions); err != nil {
+	if _, _, _, err := s.ExecuteTriggerInterceptors(context.Background(), trigger, req, []byte(rawBody), s.Logger, eventID, extensions); err != nil {
 		t.Fatalf("executeInterceptors: %v", err)
 	}
 
@@ -2186,6 +2191,7 @@ func TestExecuteInterceptors_ConcurrentMapWrite(t *testing.T) {
 			defer wg.Done()
 
 			_, _, _, err := r.ExecuteInterceptors(
+				context.Background(),
 				interceptors,
 				req.Clone(req.Context()),
 				[]byte(`{}`),

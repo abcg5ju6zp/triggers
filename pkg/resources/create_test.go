@@ -17,6 +17,7 @@ limitations under the License.
 package resources
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -196,7 +197,7 @@ func TestCreateResource(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dynamicClient.ClearActions()
-			if err := Create(logger.Sugar(), tt.json, triggerName, eventID, elName, elNamespace, kubeClient.Discovery(), dynamicClient); err != nil {
+			if err := Create(logger.Sugar(), context.Background(), tt.json, triggerName, eventID, elName, elNamespace, kubeClient.Discovery(), dynamicClient); err != nil {
 				t.Errorf("createTaskRun() returned error: %s", err)
 			}
 

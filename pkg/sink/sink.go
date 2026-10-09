@@ -72,10 +72,17 @@ type Sink struct {
 	PayloadValidation      bool
 	MaxBodySize            int64
 	CloudEventURI          string
-	// WGProcessTriggers keeps track of triggers or triggerGroups currently being processed
-	// Currently only used in tests to wait for all triggers to finish processing
+	// WGProcessTriggers mirrors the branch accounting kept by Inflight and is
+	// kept around for tests (and offline tools) that need to wait until all
+	// triggers and trigger groups spawned by the sink have finished.
 	WGProcessTriggers *sync.WaitGroup
-	EventRecorder     record.EventRecorder
+	// Inflight tracks every accepted eventID and all of its processing
+	// branches so that the sink can stop accepting new events first and then
+	// drain accepted events gracefully on shutdown. When nil, per-request
+	// tracking is still used but process-wide shutdown coordination is
+	// disabled (used by offline CLIs).
+	Inflight      *InflightTracker
+	EventRecorder record.EventRecorder
 
 	// listers index properties about resources
 	EventListenerLister         listers.EventListenerLister
@@ -90,9 +97,11 @@ type Sink struct {
 // Response defines the HTTP body that the Sink responds to events with.
 type Response struct {
 	// EventListener is the name of the eventListener.
+	//
 	// Deprecated: use EventListenerUID instead.
 	EventListener string `json:"eventListener"`
 	// Namespace is the namespace that the eventListener is running in.
+	//
 	// Deprecated: use EventListenerUID instead.
 	Namespace string `json:"namespace,omitempty"`
 	// EventListenerUID is the UID of the EventListener
@@ -194,23 +203,47 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 		r.sendCloudEvents(nil, *el, eventID, events.TriggerProcessingFailedV1)
 		return
 	}
-	r.WGProcessTriggers.Add(len(mergedTriggers))
+
+	// Reserve all outer branches atomically. Once shutdown has started this
+	// fails and the event must not be acknowledged with 202: reply with 503 so
+	// the sender can tell the event was never accepted and retry it.
+	inflight := r.inflight()
+	inflightEvent, err := inflight.accept(eventID, len(mergedTriggers)+len(el.Spec.TriggerGroups))
+	if err != nil {
+		log.Infof("rejecting event while shutting down: %v", err)
+		r.recordCountMetrics(failTag)
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusServiceUnavailable)
+		rejectBody := Response{
+			EventListener:    r.EventListenerName,
+			EventListenerUID: elUID,
+			Namespace:        r.EventListenerNamespace,
+			EventID:          eventID,
+			ErrorMessage:     err.Error(),
+		}
+		if encodeErr := json.NewEncoder(response).Encode(rejectBody); encodeErr != nil {
+			log.Errorf("failed to write back sink response: %v", encodeErr)
+		}
+		r.emitEvents(r.EventRecorder, el, events.TriggerProcessingFailedV1, err)
+		r.sendCloudEvents(request.Header, *el, eventID, events.TriggerProcessingFailedV1)
+		return
+	}
+
 	for _, t := range mergedTriggers {
 		go func(t triggersv1.Trigger) {
-			defer r.WGProcessTriggers.Done()
+			defer inflightEvent.done()
 			localRequest := request.Clone(request.Context())
 			emptyExtensions := make(map[string]interface{})
-			r.processTrigger(t, el, localRequest, event, eventID, log, emptyExtensions)
+			r.processTrigger(inflightEvent, t, el, localRequest, event, eventID, log, emptyExtensions)
 		}(*t)
 	}
 
 	// Process grouped triggers
 	for _, group := range el.Spec.TriggerGroups {
-		r.WGProcessTriggers.Add(1)
 		go func(g triggersv1.EventListenerTriggerGroup) {
-			defer r.WGProcessTriggers.Done()
+			defer inflightEvent.done()
 			localRequest := request.Clone(request.Context())
-			r.processTriggerGroups(g, el, localRequest, event, eventID, log, r.WGProcessTriggers)
+			r.processTriggerGroups(inflightEvent, g, el, localRequest, event, eventID, log)
 		}(group)
 	}
 
@@ -258,19 +291,33 @@ func (r Sink) HandleEvent(response http.ResponseWriter, request *http.Request) {
 	r.sendCloudEvents(nil, *el, eventID, events.TriggerProcessingDoneV1)
 }
 
-func (r Sink) sendCloudEvents(headers http.Header, el triggersv1.EventListener, eventID, eventType string) {
+// inflight returns the process-wide tracker when the sink runs as a server, or
+// an ephemeral tracker bound to the legacy WaitGroup for offline/test use. The
+// ephemeral tracker is only used within the lifetime of a single HandleEvent
+// invocation, which is sufficient to coordinate that event's branches.
+func (r Sink) inflight() *InflightTracker {
+	if r.Inflight != nil {
+		return r.Inflight
+	}
+	return NewInflightTracker(r.WGProcessTriggers)
+}
+
+// newCloudEventResource builds the cloudevent resource for a status
+// notification. Returns nil when CloudEvent delivery is not configured or the
+// headers cannot be marshaled.
+func (r Sink) newCloudEventResource(headers http.Header, el triggersv1.EventListener, eventID, eventType string) *cloudevent.Resource {
 	data, err := json.Marshal(headers)
 	if err != nil {
 		r.Logger.Errorf("Error marshaling request Headers to json: %s", err)
-		return
+		return nil
 	}
 
 	// If no cloudEventURI, then don't try to sendCloudEvents
 	if r.CloudEventURI == "" {
-		return
+		return nil
 	}
 
-	resource := cloudevent.Resource{
+	return &cloudevent.Resource{
 		EventID:   eventID,
 		EventType: eventType,
 		TargetURI: r.CloudEventURI,
@@ -279,8 +326,37 @@ func (r Sink) sendCloudEvents(headers http.Header, el triggersv1.EventListener, 
 		Data:      data,
 		EL:        el,
 	}
+}
 
-	go resource.SendCloudEvents()
+// sendCloudEvents emits handler-level status CloudEvents asynchronously. The
+// delivery is tracked by the inflight tracker (when present) so that shutdown
+// waits for notifications already in flight.
+func (r Sink) sendCloudEvents(headers http.Header, el triggersv1.EventListener, eventID, eventType string) {
+	resource := r.newCloudEventResource(headers, el, eventID, eventType)
+	if resource == nil {
+		return
+	}
+	if r.Inflight != nil {
+		r.Inflight.notifyGo(func() {
+			resource.SendCloudEvents(context.Background())
+		})
+		return
+	}
+	go resource.SendCloudEvents(context.Background())
+}
+
+// sendCloudEventSync sends a terminal (per-trigger) CloudEvent synchronously so
+// that resource creation result and terminal notification cannot be split: the
+// processing branch is only considered done once the delivery has either been
+// acknowledged or exhausted its retries. Callers pass a context detached from
+// shutdown cancellation so a delivery already in progress during shutdown is
+// allowed to finish.
+func (r Sink) sendCloudEventSync(ctx context.Context, headers http.Header, el triggersv1.EventListener, eventID, eventType string) {
+	resource := r.newCloudEventResource(headers, el, eventID, eventType)
+	if resource == nil {
+		return
+	}
+	resource.SendCloudEvents(ctx)
 }
 
 func (r Sink) merge(et []triggersv1.EventListenerTrigger, trItems []*triggersv1.Trigger) ([]*triggersv1.Trigger, error) {
@@ -313,13 +389,18 @@ func (r Sink) merge(et []triggersv1.EventListenerTrigger, trItems []*triggersv1.
 	return triggers, nil
 }
 
-func (r Sink) processTriggerGroups(g triggersv1.EventListenerTriggerGroup, el *triggersv1.EventListener, request *http.Request, event []byte, eventID string, eventLog *zap.SugaredLogger, wg *sync.WaitGroup) {
+func (r Sink) processTriggerGroups(inflightEvent *acceptedEvent, g triggersv1.EventListenerTriggerGroup, el *triggersv1.EventListener, request *http.Request, event []byte, eventID string, eventLog *zap.SugaredLogger) {
 	log := eventLog.With(zap.String(triggers.TriggerGroupLabelKey, g.Name))
+	ctx := inflightEvent.ctx
 
 	extensions := map[string]interface{}{}
-	payload, header, resp, err := r.ExecuteInterceptors(g.Interceptors, request, event, log, eventID, fmt.Sprintf("namespaces/%s/triggerGroups/%s", r.EventListenerNamespace, g.Name), r.EventListenerNamespace, extensions)
+	payload, header, resp, err := r.ExecuteInterceptors(ctx, g.Interceptors, request, event, log, eventID, fmt.Sprintf("namespaces/%s/triggerGroups/%s", r.EventListenerNamespace, g.Name), r.EventListenerNamespace, extensions)
 	if err != nil {
-		log.Error(err)
+		if ctx.Err() != nil {
+			r.emitInterrupted(inflightEvent, el, header, eventID, log)
+		} else {
+			log.Error(err)
+		}
 		return
 	}
 	if resp != nil {
@@ -334,8 +415,15 @@ func (r Sink) processTriggerGroups(g triggersv1.EventListenerTriggerGroup, el *t
 		}
 	}
 
+	// Do not select or start new group branches after the grace period expired.
+	if err := ctx.Err(); err != nil {
+		r.emitInterrupted(inflightEvent, el, header, eventID, log)
+		return
+	}
+
 	trItems, err := r.selectTriggers(g.TriggerSelector.NamespaceSelector, g.TriggerSelector.LabelSelector)
 	if err != nil {
+		log.Error(err)
 		return
 	}
 
@@ -345,14 +433,17 @@ func (r Sink) processTriggerGroups(g triggersv1.EventListenerTriggerGroup, el *t
 	triggerReq.Header = header
 	triggerReq.Body = io.NopCloser(bytes.NewBuffer(payload))
 
-	wg.Add(len(trItems))
+	// Inner branches are reserved while this outer group branch is still
+	// running, so the event-wide counter cannot hit zero before the inner
+	// branches are registered.
+	inflightEvent.add(len(trItems))
 	for _, t := range trItems {
 		go func(t triggersv1.Trigger) {
-			defer wg.Done()
+			defer inflightEvent.done()
 			// TODO(dibyom): We might be able to get away with only cloning if necessary
 			// i.e. if there are interceptors and iff those interceptors will modify the body/header (i.e. webhook)
 			localRequest := triggerReq.Clone(triggerReq.Context())
-			r.processTrigger(t, el, localRequest, event, eventID, log, extensions)
+			r.processTrigger(inflightEvent, t, el, localRequest, event, eventID, log, extensions)
 		}(*t)
 	}
 }
@@ -406,12 +497,17 @@ func (r Sink) selectTriggers(namespaceSelector triggersv1.NamespaceSelector, lab
 	return trItems, nil
 }
 
-func (r Sink) processTrigger(t triggersv1.Trigger, el *triggersv1.EventListener, request *http.Request, event []byte, eventID string, eventLog *zap.SugaredLogger, extensions map[string]interface{}) {
+func (r Sink) processTrigger(inflightEvent *acceptedEvent, t triggersv1.Trigger, el *triggersv1.EventListener, request *http.Request, event []byte, eventID string, eventLog *zap.SugaredLogger, extensions map[string]interface{}) {
 	log := eventLog.With(zap.String(triggers.TriggerLabelKey, t.Name))
+	ctx := inflightEvent.ctx
 
-	finalPayload, header, iresp, err := r.ExecuteTriggerInterceptors(t, request, event, log, eventID, extensions)
+	finalPayload, header, iresp, err := r.ExecuteTriggerInterceptors(ctx, t, request, event, log, eventID, extensions)
 	if err != nil {
-		log.Error(err)
+		if ctx.Err() != nil {
+			r.emitInterrupted(inflightEvent, el, header, eventID, log)
+		} else {
+			log.Error(err)
+		}
 		return
 	}
 
@@ -445,22 +541,51 @@ func (r Sink) processTrigger(t triggersv1.Trigger, el *triggersv1.EventListener,
 	log.Infof("ResolvedParams : %+v", params)
 	resources := template.ResolveResources(rt.TriggerTemplate, params)
 
-	if err := r.CreateResources(t.Namespace, t.Spec.ServiceAccountName, resources, t.Name, eventID, log); err != nil {
-		log.Error(err)
+	// Do not enter the resource creation commit phase after the grace period
+	// expired. CreateResources additionally re-checks the context between
+	// individual resources so that an interruption cannot surface as a
+	// successful terminal event for a partially created set.
+	if err := ctx.Err(); err != nil {
+		r.emitInterrupted(inflightEvent, el, header, eventID, log)
 		return
 	}
-	go r.recordResourceCreation(resources)
+
+	if err := r.CreateResources(ctx, t.Namespace, t.Spec.ServiceAccountName, resources, t.Name, eventID, log); err != nil {
+		if errors.Is(err, ErrEventInterrupted) {
+			r.emitInterrupted(inflightEvent, el, header, eventID, log)
+		} else {
+			log.Error(err)
+		}
+		return
+	}
+
+	// All resources were created: record the metric and emit the terminal
+	// notifications synchronously before this branch is marked done, so a
+	// shutting down process never exits between committing resources and
+	// delivering their terminal state.
+	r.recordResourceCreation(resources)
 	r.emitEvents(r.EventRecorder, el, events.TriggerProcessingSuccessfulV1, nil)
-	r.sendCloudEvents(request.Header, *el, eventID, events.TriggerProcessingSuccessfulV1)
+	r.sendCloudEventSync(context.WithoutCancel(ctx), request.Header, *el, eventID, events.TriggerProcessingSuccessfulV1)
 }
 
-func (r Sink) ExecuteTriggerInterceptors(t triggersv1.Trigger, in *http.Request, event []byte, log *zap.SugaredLogger, eventID string, extensions map[string]interface{}) ([]byte, http.Header, *triggersv1.InterceptorResponse, error) {
-	return r.ExecuteInterceptors(t.Spec.Interceptors, in, event, log, eventID, fmt.Sprintf("namespaces/%s/triggers/%s", t.Namespace, t.Name), t.Namespace, extensions)
+// emitInterrupted emits the deterministic terminal result for a branch that
+// could not finish before the shutdown grace period expired: a failed
+// Kubernetes Event and a failed CloudEvent carrying the eventID, so senders
+// can correlate the incomplete result and retry the same event.
+func (r Sink) emitInterrupted(inflightEvent *acceptedEvent, el *triggersv1.EventListener, headers http.Header, eventID string, log *zap.SugaredLogger) {
+	err := fmt.Errorf("%w (eventID=%s); retry the event with the same eventID, resources may have been partially created", ErrEventInterrupted, eventID)
+	log.Warn(err.Error())
+	r.emitEvents(r.EventRecorder, el, events.TriggerProcessingFailedV1, err)
+	r.sendCloudEventSync(context.WithoutCancel(inflightEvent.ctx), headers, *el, eventID, events.TriggerProcessingFailedV1)
+}
+
+func (r Sink) ExecuteTriggerInterceptors(ctx context.Context, t triggersv1.Trigger, in *http.Request, event []byte, log *zap.SugaredLogger, eventID string, extensions map[string]interface{}) ([]byte, http.Header, *triggersv1.InterceptorResponse, error) {
+	return r.ExecuteInterceptors(ctx, t.Spec.Interceptors, in, event, log, eventID, fmt.Sprintf("namespaces/%s/triggers/%s", t.Namespace, t.Name), t.Namespace, extensions)
 }
 
 // ExecuteInterceptor executes all interceptors for the Trigger and returns back the body, header, and InterceptorResponse to use.
 // When TEP-0022 is fully implemented, this function will only return the InterceptorResponse and error.
-func (r Sink) ExecuteInterceptors(trInt []*triggersv1.TriggerInterceptor, in *http.Request, event []byte, log *zap.SugaredLogger, eventID string, triggerID string, namespace string, extensions map[string]interface{}) ([]byte, http.Header, *triggersv1.InterceptorResponse, error) {
+func (r Sink) ExecuteInterceptors(ctx context.Context, trInt []*triggersv1.TriggerInterceptor, in *http.Request, event []byte, log *zap.SugaredLogger, eventID string, triggerID string, namespace string, extensions map[string]interface{}) ([]byte, http.Header, *triggersv1.InterceptorResponse, error) {
 	if len(trInt) == 0 {
 		return event, in.Header, nil, nil
 	}
@@ -512,12 +637,12 @@ func (r Sink) ExecuteInterceptors(trInt []*triggersv1.TriggerInterceptor, in *ht
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("could not merge extensions with body: %w", err)
 			}
-			req := &http.Request{
+			req := (&http.Request{
 				Method: http.MethodPost,
 				Header: request.Header,
 				URL:    in.URL,
 				Body:   io.NopCloser(bytes.NewBuffer(body)),
-			}
+			}).WithContext(ctx)
 			interceptor := webhook.NewInterceptor(i.Webhook, r.HTTPClient, namespace, log)
 			res, err := interceptor.ExecuteTrigger(req)
 			if err != nil {
@@ -569,7 +694,7 @@ func (r Sink) ExecuteInterceptors(trInt []*triggersv1.TriggerInterceptor, in *ht
 			}
 		}
 
-		interceptorResponse, err := interceptors.Execute(context.Background(), r.HTTPClient, &request, url.String())
+		interceptorResponse, err := interceptors.Execute(ctx, r.HTTPClient, &request, url.String())
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -594,7 +719,15 @@ func (r Sink) ExecuteInterceptors(trInt []*triggersv1.TriggerInterceptor, in *ht
 	}, nil
 }
 
-func (r Sink) CreateResources(triggerNS, sa string, res []json.RawMessage, triggerName, eventID string, log *zap.SugaredLogger) error {
+// CreateResources creates all rendered resources for one trigger.
+//
+// Cancellation semantics during graceful shutdown:
+//   - ctx is checked before every resource so that work which has not started
+//     yet is skipped and the branch reports an ErrEventInterrupted result;
+//   - a Kubernetes create call which has already been submitted uses a context
+//     detached from cancellation, so shutdown waits for the API server to
+//     answer instead of abandoning a possibly-created resource.
+func (r Sink) CreateResources(ctx context.Context, triggerNS, sa string, res []json.RawMessage, triggerName, eventID string, log *zap.SugaredLogger) error {
 	discoveryClient := r.DiscoveryClient
 	dynamicClient := r.DynamicClient
 	var err error
@@ -612,7 +745,12 @@ func (r Sink) CreateResources(triggerNS, sa string, res []json.RawMessage, trigg
 	}
 
 	for _, rr := range res {
-		if err := resources.Create(r.Logger, rr, triggerName, eventID, r.EventListenerName, triggerNS, discoveryClient, dynamicClient); err != nil {
+		// Skip resources that have not been started yet when the grace period
+		// expired. A create already submitted below is not interrupted.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("eventID %s trigger %s: %w", eventID, triggerName, errors.Join(ErrEventInterrupted, err))
+		}
+		if err := resources.Create(r.Logger, context.WithoutCancel(ctx), rr, triggerName, eventID, r.EventListenerName, triggerNS, discoveryClient, dynamicClient); err != nil {
 			log.Errorf("problem creating obj: %#v", err)
 			return err
 		}
